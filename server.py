@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 import re
 from datetime import datetime
 import sys
+from itertools import cycle
+import asyncio
 
 # Load environment variables from .env file
 load_dotenv()
@@ -44,15 +46,38 @@ class MessageFilter(logging.Filter):
             "cost_calculator"
         ]
 
-        if hasattr(record, 'msg') and isinstance(record.msg, str):
-            for phrase in blocked_phrases:
-                if phrase in record.msg:
-                    return False
+        message = record.getMessage()
+        for phrase in blocked_phrases:
+            if phrase in message:
+                return False
         return True
 
 # Apply the filter to the root logger to catch all messages
 root_logger = logging.getLogger()
 root_logger.addFilter(MessageFilter())
+
+# -------- Redact sensitive tokens from any log messages --------
+class RedactAPIKeyFilter(logging.Filter):
+    _patterns = [
+        (re.compile(r"key=[A-Za-z0-9_\-]+"), "key=***"),
+        (re.compile(r"Bearer [A-Za-z0-9_\-]+"), "Bearer ***"),
+        (re.compile(r"sk-[A-Za-z0-9]{20,}"), "sk-***"),
+        (re.compile(r"AIza[A-Za-z0-9_-]+"), "AIza***"),
+    ]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if hasattr(record, "msg") and isinstance(record.msg, str):
+            msg = record.msg
+            for pat, repl in self._patterns:
+                msg = pat.sub(repl, msg)
+            record.msg = msg
+        return True
+
+root_logger.addFilter(RedactAPIKeyFilter())
+
+# Silence noisy third-party loggers
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("litellm").setLevel(logging.WARNING)
 
 # Enable dropping unsupported parameters for LiteLLM
 litellm.drop_params = True
@@ -87,6 +112,7 @@ app = FastAPI()
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 # For Vertex AI, LiteLLM typically uses Application Default Credentials (ADC)
 # Ensure ADC is set up (e.g., `gcloud auth application-default login`)
@@ -121,9 +147,27 @@ PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
 logger.info(f"🔧 Preferred provider set to: {PREFERRED_PROVIDER}")
 
 # Get model mapping configuration from environment
-# Default to latest OpenAI models if not set
-BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
-SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
+# Default models now depend on the preferred provider
+if PREFERRED_PROVIDER == "google":
+    BIG_MODEL_DEFAULT = "gemini-1.5-pro-latest"
+    SMALL_MODEL_DEFAULT = "gemini-1.5-flash-latest"
+elif PREFERRED_PROVIDER == "vertex":
+    BIG_MODEL_DEFAULT = "gemini-1.5-pro-preview-0514"
+    SMALL_MODEL_DEFAULT = "gemini-1.5-flash-preview-0514"
+elif PREFERRED_PROVIDER == "xai":
+    BIG_MODEL_DEFAULT = "grok-3-beta"
+    SMALL_MODEL_DEFAULT = "grok-3-mini-beta"
+elif PREFERRED_PROVIDER == "openrouter":
+    BIG_MODEL_DEFAULT = "anthropic/claude-3-sonnet"
+    SMALL_MODEL_DEFAULT = "mistralai/mistral-7b-instruct:free"
+else:  # Default to openai
+    BIG_MODEL_DEFAULT = "gpt-4o"
+    SMALL_MODEL_DEFAULT = "gpt-4o-mini"
+
+BIG_MODEL = os.environ.get("BIG_MODEL", BIG_MODEL_DEFAULT).strip()
+SMALL_MODEL = os.environ.get("SMALL_MODEL", SMALL_MODEL_DEFAULT).strip()
+
+logger.info(f"🗺️  Model Mapping: Sonnet (big) -> {BIG_MODEL}, Haiku (small) -> {SMALL_MODEL}")
 
 # List of OpenAI models
 OPENAI_MODELS = [
@@ -858,10 +902,15 @@ async def create_message(
 
         # Determine API key/credentials based on the final model's provider prefix
         if request.model.startswith("openai/"):
-            litellm_request["api_key"] = OPENAI_API_KEY
+            litellm_request["api_key"] = get_api_key("openai") or OPENAI_API_KEY
             logger.debug(f"Using OpenAI API key for model: {request.model}")
+        elif request.model.startswith("openrouter/"):
+            litellm_request["api_key"] = get_api_key("openrouter") or OPENROUTER_API_KEY
+            # 指定 OpenRouter 专属 base URL
+            litellm_request["api_base"] = "https://openrouter.ai/v1"
+            logger.debug(f"Using OpenRouter API key for model: {request.model}")
         elif request.model.startswith("gemini/"): # Google AI Studio
-            litellm_request["api_key"] = GEMINI_API_KEY
+            litellm_request["api_key"] = get_api_key("gemini") or GEMINI_API_KEY
             logger.debug(f"Using Gemini (Google AI Studio) API key for model: {request.model}")
         elif request.model.startswith("vertex_ai/"):
             if VERTEX_PROJECT_ID:
@@ -880,8 +929,9 @@ async def create_message(
         #     litellm_request["api_key"] = GROQ_API_KEY
         #     logger.debug(f"Using Groq API key for model: {request.model}")
         elif request.model.startswith("xai/"):
-            if XAI_API_KEY:
-                litellm_request["api_key"] = XAI_API_KEY
+            selected_key = get_api_key("xai") or XAI_API_KEY
+            if selected_key:
+                litellm_request["api_key"] = selected_key
                 logger.info(f"🟣 Using xAI API key for model: {request.model}")
 
                 # Validate model name against known models
@@ -910,12 +960,12 @@ async def create_message(
         )
 
         if request.stream:
-            response_generator = await litellm.acompletion(**litellm_request)
+            response_generator = await send_with_key_retry(litellm_request, request.model)
             return StreamingResponse(handle_streaming(response_generator, request), media_type="text/event-stream")
         else:
             start_time = time.time()
             logger.info(f"🚀 Sending request to {request.model}...")
-            litellm_response = await litellm.acompletion(**litellm_request) # Use async for consistency
+            litellm_response = await send_with_key_retry(litellm_request, request.model)
             elapsed_time = time.time() - start_time
 
             # Enhanced provider-specific response logging
@@ -1042,6 +1092,7 @@ def log_request_beautifully(method, path, original_model_display, mapped_model, 
         try:
             target_provider, target_model_name = mapped_model.split("/", 1)
             if target_provider == "openai": target_color = Colors.GREEN
+            elif target_provider == "openrouter": target_color = Colors.GREEN
             elif target_provider == "gemini": target_color = Colors.YELLOW
             elif target_provider == "vertex_ai": target_color = Colors.BLUE
             # elif target_provider == "groq": target_color = Colors.MAGENTA # Removed Groq color
@@ -1063,6 +1114,129 @@ def log_request_beautifully(method, path, original_model_display, mapped_model, 
     print(log_line)
     print(model_line)
     sys.stdout.flush()
+
+# ====== Multi-API Key Support ======
+def _parse_key_list(keys_str: str):
+    """Parse key list supporting comma或换行分隔，并去除多余的反斜杠。"""
+    if not keys_str:
+        return []
+    # 先替换换行为空格方便统一处理
+    cleaned = keys_str.replace("\n", ",")
+    parts = [p.strip().lstrip("\\").rstrip("\\") for p in cleaned.split(",")]
+    return [p for p in parts if p]
+
+# Pools for each provider
+OPENAI_KEY_POOL = _parse_key_list(os.environ.get("OPENAI_API_KEYS", os.environ.get("OPENAI_API_KEY", "")))
+GEMINI_KEY_POOL = _parse_key_list(os.environ.get("GEMINI_API_KEYS", os.environ.get("GEMINI_API_KEY", "")))
+XAI_KEY_POOL = _parse_key_list(os.environ.get("XAI_API_KEYS", os.environ.get("XAI_API_KEY", "")))
+OPENROUTER_KEY_POOL = _parse_key_list(os.environ.get("OPENROUTER_API_KEYS", os.environ.get("OPENROUTER_API_KEY", "")))
+
+# Register pools for easy lookup
+KEY_POOLS = {"openai": OPENAI_KEY_POOL, "openrouter": OPENROUTER_KEY_POOL, "gemini": GEMINI_KEY_POOL, "xai": XAI_KEY_POOL}
+
+# Create cycling iterators for round-robin selection
+ITERATORS = {provider: cycle(keys) for provider, keys in KEY_POOLS.items() if keys}
+
+# Log key pool status for transparency
+for _prov, _keys in KEY_POOLS.items():
+    if _keys:
+        logger.info(f"🔑 Loaded {_prov.upper()} key pool: {len(_keys)} keys (rotation enabled)")
+    else:
+        logger.warning(f"⚠️ No API keys found for provider '{_prov}'. Requests will fail unless keys are added.")
+
+def get_api_key(provider: str):
+    """Return the next API key for the given provider (round-robin)."""
+    iterator = ITERATORS.get(provider)
+    if iterator:
+        return next(iterator)
+    return None
+
+# 现在挂载模型路由（get_api_key 已就绪）
+try:
+    from models_router import router as models_router
+    import models_router as _mr
+    _mr.get_api_key = get_api_key  # 注入真实轮询函数
+    app.include_router(models_router)
+    logger.info("📚 Model list endpoints mounted under /v1/models")
+except Exception as e:
+    logger.warning(f"Could not mount models router: {e}")
+
+async def send_with_key_retry(req: Dict[str, Any], model_name: str, max_attempts: int = 5):
+    """Send a request with automatic API-key rotation when failures occur."""
+    provider = None
+    if model_name.startswith("openai/"): provider = "openai"
+    elif model_name.startswith("openrouter/"): provider = "openrouter"
+    elif model_name.startswith("gemini/"): provider = "gemini"
+    elif model_name.startswith("xai/"): provider = "xai"
+
+    attempts = 0
+    tried_keys = set()
+    while attempts < max_attempts:
+        attempts += 1
+        # Pick/rotate key if pool exists
+        if provider in KEY_POOLS and KEY_POOLS[provider]:
+            api_key = get_api_key(provider)
+            tried_keys.add(api_key)
+            req["api_key"] = api_key
+            obfuscated = f"{api_key[:6]}...{api_key[-4:]}" if len(api_key) > 10 else api_key
+            logger.info(f"🔄 [{provider}] Attempt {attempts} using key: {obfuscated}")
+
+        try:
+            return await litellm.acompletion(**req)
+        except Exception as e:
+            logger.warning(f"⚠️ Attempt {attempts} for provider {provider} failed: {e}")
+            # Stop retrying if we've exhausted the pool or provider not handled
+            if provider not in KEY_POOLS or len(tried_keys) >= len(KEY_POOLS[provider]):
+                raise
+            # Otherwise continue to next key
+            continue
+
+# ========== 自动预取模型列表并更新 ===========
+async def _refresh_available_models():
+    """Fetch model lists from providers at startup and update global constants."""
+    try:
+        from models_router import _fetch_openrouter_models, _fetch_gemini_models, _fetch_vertex_models
+    except Exception as e:
+        logger.warning(f"Model router not available for refresh: {e}")
+        return
+
+    global OPENAI_MODELS, GEMINI_MODELS, VERTEX_AI_MODELS
+
+    try:
+        openrouter_models = await _fetch_openrouter_models(refresh=True)
+        if openrouter_models:
+            OPENAI_MODELS = list(sorted(set(openrouter_models)))
+            logger.info(f"🔄 OpenRouter models refreshed: {len(OPENAI_MODELS)} models")
+    except Exception as e:
+        logger.warning(f"Could not refresh OpenRouter models: {type(e).__name__} - {getattr(e, 'detail', str(e))}")
+
+    try:
+        gemini_models = await _fetch_gemini_models(refresh=True)
+        if gemini_models:
+            # Strip "models/" prefix and update the list
+            GEMINI_MODELS[:] = list(sorted(set([m.replace("models/", "") for m in gemini_models])))
+            logger.info(f"🔄 Gemini models refreshed: {len(GEMINI_MODELS)} models")
+    except Exception as e:
+        logger.warning(f"Could not refresh Gemini models: {type(e).__name__} - {getattr(e, 'detail', str(e))}")
+
+    try:
+        if VERTEX_PROJECT_ID:
+             vertex_models = await _fetch_vertex_models(VERTEX_PROJECT_ID, VERTEX_LOCATION, refresh=True)
+             if vertex_models:
+                # Vertex models can have complex paths, extract the final part
+                cleaned_vertex = [m.split('/')[-1] for m in vertex_models]
+                VERTEX_AI_MODELS[:] = list(sorted(set(cleaned_vertex)))
+                logger.info(f"🔄 Vertex AI models refreshed: {len(VERTEX_AI_MODELS)} models")
+    except Exception as e:
+        logger.warning(f"Could not refresh Vertex models: {type(e).__name__} - {getattr(e, 'detail', str(e))}")
+
+# 在 FastAPI 启动时启动后台任务
+@app.on_event("startup")
+async def startup_refresh_models():
+    logger.info("⏳ Refreshing model lists at startup...")
+    await _refresh_available_models()
+    logger.info("✅ Model lists refreshed.")
+# ========== 结束自动预取 ==========
 
 if __name__ == "__main__":
     import sys
