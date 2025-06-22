@@ -810,7 +810,8 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
 
 
 def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
-                                 original_request: MessagesRequest) -> MessagesResponse:
+                                 original_request: MessagesRequest,
+                                 original_model_override: Optional[str] = None) -> MessagesResponse:
     """Convert LiteLLM (OpenAI format) response to Anthropic API response format."""
     try:
         prompt_tokens, completion_tokens, response_id = 0, 0, f"msg_{uuid.uuid4()}"
@@ -876,8 +877,11 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
 
         if not content: content.append({"type": "text", "text": ""})
 
+        # Use the override if available, otherwise fall back to pydantic model fields
+        final_model_name = original_model_override or original_request.original_model or original_request.model
+
         return MessagesResponse(
-            id=response_id, model=original_request.original_model or original_request.model,
+            id=response_id, model=final_model_name,
             role="assistant", content=content, stop_reason=stop_reason, stop_sequence=None,
             usage=Usage(input_tokens=prompt_tokens, output_tokens=completion_tokens)
         )
@@ -1067,7 +1071,7 @@ async def create_message(
                 logger.info(f"🟢 OPENAI RESPONSE RECEIVED: Model={request.model}, Time={elapsed_time:.2f}s")
             else:
                 logger.info(f"✅ RESPONSE RECEIVED: Model={request.model}, Time={elapsed_time:.2f}s")
-            anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
+            anthropic_response = convert_litellm_to_anthropic(litellm_response, request, original_model_override=original_model)
             return anthropic_response
 
     except Exception as e:
