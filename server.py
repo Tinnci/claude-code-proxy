@@ -217,6 +217,34 @@ XAI_MODELS = [
 ]
 logger.info(f"🟣 xAI models available: {', '.join(XAI_MODELS)}")
 
+# ---------- Gemini model helper ----------
+# 动态挑选最新的 pro / flash / flash-lite 变体，避免硬编码具体版本号
+import re
+from typing import Optional
+
+def _pick_latest_gemini(variant_keyword: str) -> Optional[str]:
+    """Return the newest Gemini model name that contains the given variant keyword (e.g. 'pro', 'flash', 'flash-lite').
+    排序策略：先比较版本号（如 2.5 > 2.0 > 1.5），再比较完整字符串。
+    如果没有找到匹配的模型则返回 None。"""
+    # 确保 GEMINI_MODELS 已刷新（startup_refresh_models 会更新）。
+    candidates = [m for m in GEMINI_MODELS if variant_keyword in m and "tts" not in m.lower()]
+    if not candidates:
+        return None
+
+    def _version_score(name: str) -> float:
+        match = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+        return float(match.group(1)) if match else 0.0
+
+    # 取版本号最高的；若相同按字符串排序保证确定性
+    return max(candidates, key=lambda n: (_version_score(n), n))
+
+LATEST_GEMINI_PRO: Optional[str] = _pick_latest_gemini("-pro") or "gemini-1.5-pro-latest"
+LATEST_GEMINI_FLASH: Optional[str] = _pick_latest_gemini("-flash") or "gemini-1.5-flash-latest"
+LATEST_GEMINI_FLASH_LITE: Optional[str] = _pick_latest_gemini("flash-lite") or LATEST_GEMINI_FLASH
+
+logger.info(
+    f"🟡 Gemini variants → pro:{LATEST_GEMINI_PRO}, flash:{LATEST_GEMINI_FLASH}, flash-lite:{LATEST_GEMINI_FLASH_LITE}"
+)
 
 # Helper function to clean schema for Gemini/Vertex
 def clean_gemini_schema(schema: Any) -> Any:
@@ -317,46 +345,70 @@ class MessagesRequest(BaseModel):
         elif clean_v.startswith('xai/'):
             clean_v = clean_v[4:]
 
-
         # --- Mapping Logic --- START ---
         mapped = False
-        # Map Haiku (small) based on provider preference
-        if 'haiku' in clean_v.lower():
-            if PREFERRED_PROVIDER == "xai" and SMALL_MODEL in XAI_MODELS:
+        lower_clean = clean_v.lower()
+
+        # === Claude 系列名称映射 ===
+        if "haiku" in lower_clean:  # 最小模型
+            if PREFERRED_PROVIDER == "google" and LATEST_GEMINI_FLASH_LITE:
+                new_model = f"gemini/{LATEST_GEMINI_FLASH_LITE}"
+                mapped = True
+            elif PREFERRED_PROVIDER == "xai" and SMALL_MODEL in XAI_MODELS:
                 new_model = f"xai/{SMALL_MODEL}"
                 mapped = True
-            # elif PREFERRED_PROVIDER == "groq" and SMALL_MODEL in GROQ_MODELS: # Removed Groq mapping
-            #     new_model = f"groq/{SMALL_MODEL}"
-            #     mapped = True
             elif PREFERRED_PROVIDER == "vertex" and SMALL_MODEL in VERTEX_AI_MODELS:
-                 new_model = f"vertex_ai/{SMALL_MODEL}"
-                 mapped = True
+                new_model = f"vertex_ai/{SMALL_MODEL}"
+                mapped = True
             elif PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
                 new_model = f"gemini/{SMALL_MODEL}"
                 mapped = True
-            # Fallback to OpenAI
             else:
                 new_model = f"openai/{SMALL_MODEL}"
                 mapped = True
 
-        # Map Sonnet (big) based on provider preference
-        elif 'sonnet' in clean_v.lower():
-            if PREFERRED_PROVIDER == "xai" and BIG_MODEL in XAI_MODELS:
+        elif "sonnet" in lower_clean:  # 中等模型
+            if PREFERRED_PROVIDER == "google" and LATEST_GEMINI_FLASH:
+                new_model = f"gemini/{LATEST_GEMINI_FLASH}"
+                mapped = True
+            elif PREFERRED_PROVIDER == "xai" and BIG_MODEL in XAI_MODELS:
                 new_model = f"xai/{BIG_MODEL}"
                 mapped = True
-            # elif PREFERRED_PROVIDER == "groq" and BIG_MODEL in GROQ_MODELS: # Removed Groq mapping
-            #     new_model = f"groq/{BIG_MODEL}"
-            #     mapped = True
             elif PREFERRED_PROVIDER == "vertex" and BIG_MODEL in VERTEX_AI_MODELS:
                 new_model = f"vertex_ai/{BIG_MODEL}"
                 mapped = True
             elif PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
                 new_model = f"gemini/{BIG_MODEL}"
                 mapped = True
-            # Fallback to OpenAI
             else:
                 new_model = f"openai/{BIG_MODEL}"
                 mapped = True
+
+        elif "opus" in lower_clean:  # 最大模型
+            if PREFERRED_PROVIDER == "google" and LATEST_GEMINI_PRO:
+                new_model = f"gemini/{LATEST_GEMINI_PRO}"
+                mapped = True
+            elif PREFERRED_PROVIDER == "vertex" and BIG_MODEL in VERTEX_AI_MODELS:
+                new_model = f"vertex_ai/{BIG_MODEL}"
+                mapped = True
+            else:
+                # 默认使用 OpenAI 或其他大模型，保持向后兼容
+                new_model = f"openai/{BIG_MODEL}"
+                mapped = True
+
+        # === 直接使用 gemini/pro 等别名 ===
+        elif PREFERRED_PROVIDER == "google" and v.startswith("gemini/"):
+            alias = lower_clean  # 已去掉前缀
+            if alias in {"pro", "flash", "flash-lite", "flash_lite"}:
+                chosen = {
+                    "pro": LATEST_GEMINI_PRO,
+                    "flash": LATEST_GEMINI_FLASH,
+                    "flash-lite": LATEST_GEMINI_FLASH_LITE,
+                    "flash_lite": LATEST_GEMINI_FLASH_LITE,
+                }.get(alias)
+                if chosen:
+                    new_model = f"gemini/{chosen}"
+                    mapped = True
 
         # Add prefixes to non-mapped models if they match known lists
         elif not mapped:
@@ -436,16 +488,20 @@ class TokenCountRequest(BaseModel):
             clean_v = clean_v[4:]
 
         # --- Mapping Logic --- START ---
-        # (Mirroring the logic from the main MessagesRequest validator)
         mapped = False
-        # Map Haiku (small) based on provider preference
-        if 'haiku' in clean_v.lower():
-            if PREFERRED_PROVIDER == "xai" and SMALL_MODEL in XAI_MODELS:
+        lower_clean = clean_v.lower()
+
+        # === Claude 系列名称映射 ===
+        if "haiku" in lower_clean:  # 最小模型
+            if PREFERRED_PROVIDER == "google" and LATEST_GEMINI_FLASH_LITE:
+                new_model = f"gemini/{LATEST_GEMINI_FLASH_LITE}"
+                mapped = True
+            elif PREFERRED_PROVIDER == "xai" and SMALL_MODEL in XAI_MODELS:
                 new_model = f"xai/{SMALL_MODEL}"
                 mapped = True
             elif PREFERRED_PROVIDER == "vertex" and SMALL_MODEL in VERTEX_AI_MODELS:
-                 new_model = f"vertex_ai/{SMALL_MODEL}"
-                 mapped = True
+                new_model = f"vertex_ai/{SMALL_MODEL}"
+                mapped = True
             elif PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
                 new_model = f"gemini/{SMALL_MODEL}"
                 mapped = True
@@ -453,9 +509,11 @@ class TokenCountRequest(BaseModel):
                 new_model = f"openai/{SMALL_MODEL}"
                 mapped = True
 
-        # Map Sonnet (big) based on provider preference
-        elif 'sonnet' in clean_v.lower():
-            if PREFERRED_PROVIDER == "xai" and BIG_MODEL in XAI_MODELS:
+        elif "sonnet" in lower_clean:  # 中等模型
+            if PREFERRED_PROVIDER == "google" and LATEST_GEMINI_FLASH:
+                new_model = f"gemini/{LATEST_GEMINI_FLASH}"
+                mapped = True
+            elif PREFERRED_PROVIDER == "xai" and BIG_MODEL in XAI_MODELS:
                 new_model = f"xai/{BIG_MODEL}"
                 mapped = True
             elif PREFERRED_PROVIDER == "vertex" and BIG_MODEL in VERTEX_AI_MODELS:
@@ -467,6 +525,32 @@ class TokenCountRequest(BaseModel):
             else:
                 new_model = f"openai/{BIG_MODEL}"
                 mapped = True
+
+        elif "opus" in lower_clean:  # 最大模型
+            if PREFERRED_PROVIDER == "google" and LATEST_GEMINI_PRO:
+                new_model = f"gemini/{LATEST_GEMINI_PRO}"
+                mapped = True
+            elif PREFERRED_PROVIDER == "vertex" and BIG_MODEL in VERTEX_AI_MODELS:
+                new_model = f"vertex_ai/{BIG_MODEL}"
+                mapped = True
+            else:
+                # 默认使用 OpenAI 或其他大模型，保持向后兼容
+                new_model = f"openai/{BIG_MODEL}"
+                mapped = True
+
+        # === 直接使用 gemini/pro 等别名 ===
+        elif PREFERRED_PROVIDER == "google" and v.startswith("gemini/"):
+            alias = lower_clean  # 已去掉前缀
+            if alias in {"pro", "flash", "flash-lite", "flash_lite"}:
+                chosen = {
+                    "pro": LATEST_GEMINI_PRO,
+                    "flash": LATEST_GEMINI_FLASH,
+                    "flash-lite": LATEST_GEMINI_FLASH_LITE,
+                    "flash_lite": LATEST_GEMINI_FLASH_LITE,
+                }.get(alias)
+                if chosen:
+                    new_model = f"gemini/{chosen}"
+                    mapped = True
 
         # Add prefixes to non-mapped models if they match known lists
         elif not mapped:
@@ -1216,6 +1300,12 @@ async def _refresh_available_models():
             # Strip "models/" prefix and update the list
             GEMINI_MODELS[:] = list(sorted(set([m.replace("models/", "") for m in gemini_models])))
             logger.info(f"🔄 Gemini models refreshed: {len(GEMINI_MODELS)} models")
+            # 同步更新最新变体
+            global LATEST_GEMINI_PRO, LATEST_GEMINI_FLASH, LATEST_GEMINI_FLASH_LITE
+            LATEST_GEMINI_PRO = _pick_latest_gemini("-pro") or LATEST_GEMINI_PRO
+            LATEST_GEMINI_FLASH = _pick_latest_gemini("-flash") or LATEST_GEMINI_FLASH
+            LATEST_GEMINI_FLASH_LITE = _pick_latest_gemini("flash-lite") or LATEST_GEMINI_FLASH_LITE
+            logger.info(f"🟡 Gemini latest variants refreshed → pro:{LATEST_GEMINI_PRO}, flash:{LATEST_GEMINI_FLASH}, flash-lite:{LATEST_GEMINI_FLASH_LITE}")
     except Exception as e:
         logger.warning(f"Could not refresh Gemini models: {type(e).__name__} - {getattr(e, 'detail', str(e))}")
 
