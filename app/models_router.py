@@ -1,26 +1,17 @@
 from fastapi import APIRouter, HTTPException
-import os, time, logging, sys
+import time
+import logging
 import httpx
-from functools import lru_cache
 from typing import Dict, Any
+
+# Import from the new providers module
+from app.providers import get_api_key
+from app.config import VERTEX_PROJECT_ID, VERTEX_LOCATION
 
 # 复用 server.py 中的日志格式
 logger = logging.getLogger(__name__)
 
-# 避免循环导入：此处不直接 import server，而在 server 挂载时注入 get_api_key
-def get_api_key(provider: str):
-    """Fallback key fetcher; will be overwritten by server.get_api_key on mount."""
-    env_map = {
-        "openrouter": "OPENROUTER_API_KEY",
-        "openai": "OPENAI_API_KEY",
-        "gemini": "GEMINI_API_KEY",
-        "xai": "XAI_API_KEY",
-    }
-    return os.getenv(env_map.get(provider, ""), "")
-
-# Vertex env fallback
-VERTEX_PROJECT_ID = os.getenv("VERTEX_PROJECT_ID", "")
-VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
+# Fallback get_api_key is no longer needed
 
 router = APIRouter(prefix="/v1/models", tags=["models"])
 
@@ -37,7 +28,7 @@ def cache_ttl(seconds: int = 300):
             key = func.__name__ + str(args) + str(kwargs)
             if not refresh and key in cache_data and cache_expiry.get(key, 0) > time.time():
                 return cache_data[key]
-            result = await func(*args, **kwargs)
+            result = await func(*args, refresh=refresh, **kwargs)
             cache_data[key] = result
             cache_expiry[key] = time.time() + seconds
             return result
@@ -46,8 +37,8 @@ def cache_ttl(seconds: int = 300):
 
 # ---------- OpenRouter ----------
 @cache_ttl(300)
-async def _fetch_openrouter_models():
-    api_key = (get_api_key("openrouter") or os.getenv("OPENROUTER_API_KEY", "")).strip()
+async def _fetch_openrouter_models(refresh: bool = False):
+    api_key = (get_api_key("openrouter") or "").strip()
     if not api_key:
         raise HTTPException(status_code=400, detail="OPENROUTER_API_KEY not configured or is empty.")
 
@@ -78,8 +69,8 @@ async def list_openrouter_models(refresh: bool = False):
 
 # ---------- Gemini Developer API ----------
 @cache_ttl(300)
-async def _fetch_gemini_models():
-    api_key = (get_api_key("gemini") or os.getenv("GEMINI_API_KEY", "")).strip()
+async def _fetch_gemini_models(refresh: bool = False):
+    api_key = (get_api_key("gemini") or "").strip()
     if not api_key:
         raise HTTPException(status_code=400, detail="GEMINI_API_KEY not configured or is empty.")
 
@@ -100,7 +91,7 @@ async def list_gemini_models(refresh: bool = False):
 
 # ---------- Vertex AI ----------
 @cache_ttl(300)
-async def _fetch_vertex_models(project_id: str, location: str):
+async def _fetch_vertex_models(project_id: str, location: str, refresh: bool = False):
     try:
         import google.auth
         import google.auth.transport.requests
@@ -121,8 +112,8 @@ async def _fetch_vertex_models(project_id: str, location: str):
 
 @router.get("/vertex")
 async def list_vertex_models(
-    project_id: str = VERTEX_PROJECT_ID,
-    location: str = VERTEX_LOCATION,
+    project_id: str = VERTEX_PROJECT_ID or "",
+    location: str = VERTEX_LOCATION or "us-central1",
     refresh: bool = False,
 ):
     if not project_id:

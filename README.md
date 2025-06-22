@@ -61,7 +61,11 @@ A proxy server that lets you use Anthropic clients with multiple LLM providers v
 
 4. **Run the server**:
    ```bash
-   uv run uvicorn server:app --host 0.0.0.0 --port 8082 --reload
+   # Development (auto-reload)
+   uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8082
+
+   # Production example
+   uvicorn app.main:app --host 0.0.0.0 --port 8082 --workers 4
    ```
    *(`--reload` is optional, for development)*
 
