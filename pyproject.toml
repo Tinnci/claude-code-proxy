@@ -14,3 +14,29 @@ dependencies = [
     "gnureadline>=8.2.13",
 ]
 
+# ----- 可选依赖 -----
+[project.optional-dependencies]
+# 运行 Vertex AI/Gemini on Vertex 相关功能时需要
+vertex = [
+    "google-auth>=2.29.0",
+    "google-cloud-aiplatform>=1.46.0",
+]
+
+# 本地测试与开发
+tests = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.5",
+]
+
+# ---- uv dependency groups ----
+[dependency-groups]
+tests = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.5",
+]
+
+vertex = [
+    "google-auth>=2.29.0",
+    "google-cloud-aiplatform>=1.46.0",
+]
+

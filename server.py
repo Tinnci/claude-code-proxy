@@ -15,7 +15,7 @@ import re
 from datetime import datetime
 import sys
 from itertools import cycle
-import asyncio
+import asyncio, importlib
 
 # Load environment variables from .env file
 load_dotenv()
@@ -984,6 +984,10 @@ async def create_message(
         # Convert Anthropic request to LiteLLM format
         litellm_request = convert_anthropic_to_litellm(request)
 
+        # Add global timeout and retries for robustness
+        litellm_request['timeout'] = 60
+        litellm_request['max_retries'] = 2
+
         # Determine API key/credentials based on the final model's provider prefix
         if request.model.startswith("openai/"):
             litellm_request["api_key"] = get_api_key("openai") or OPENAI_API_KEY
@@ -991,7 +995,7 @@ async def create_message(
         elif request.model.startswith("openrouter/"):
             litellm_request["api_key"] = get_api_key("openrouter") or OPENROUTER_API_KEY
             # 指定 OpenRouter 专属 base URL
-            litellm_request["api_base"] = "https://openrouter.ai/v1"
+            litellm_request["api_base"] = "https://openrouter.ai/api/v1"
             logger.debug(f"Using OpenRouter API key for model: {request.model}")
         elif request.model.startswith("gemini/"): # Google AI Studio
             litellm_request["api_key"] = get_api_key("gemini") or GEMINI_API_KEY
@@ -1252,27 +1256,43 @@ async def send_with_key_retry(req: Dict[str, Any], model_name: str, max_attempts
     elif model_name.startswith("openrouter/"): provider = "openrouter"
     elif model_name.startswith("gemini/"): provider = "gemini"
     elif model_name.startswith("xai/"): provider = "xai"
+    elif model_name.startswith("vertex_ai/"): provider = "vertex_ai"  # 新增 Vertex AI 识别
 
     attempts = 0
     tried_keys = set()
+    current_key = None
     while attempts < max_attempts:
         attempts += 1
         # Pick/rotate key if pool exists
         if provider in KEY_POOLS and KEY_POOLS[provider]:
-            api_key = get_api_key(provider)
-            tried_keys.add(api_key)
-            req["api_key"] = api_key
-            obfuscated = f"{api_key[:6]}...{api_key[-4:]}" if len(api_key) > 10 else api_key
+            current_key = get_api_key(provider)
+            tried_keys.add(current_key)
+            req["api_key"] = current_key
+            obfuscated = f"{current_key[:6]}...{current_key[-4:]}" if len(current_key) > 10 else current_key
             logger.info(f"🔄 [{provider}] Attempt {attempts} using key: {obfuscated}")
+
+        # Quick fail for unsupported Vertex
+        if provider == "vertex_ai":
+            if not importlib.util.find_spec("google.auth") or not VERTEX_PROJECT_ID:
+                raise HTTPException(501, "Vertex AI not configured (missing google-auth or VERTEX_PROJECT_ID)")
 
         try:
             return await litellm.acompletion(**req)
         except Exception as e:
+            msg = str(e)
+            # 识别 Google key 被封
+            if provider == "gemini" and ("PERMISSION_DENIED" in msg or "CONSUMER_SUSPENDED" in msg):
+                logger.error(f"🚫 Key suspended, removing from pool: {obfuscated}")
+                # 从池中移除
+                if current_key in KEY_POOLS.get(provider, []):
+                    KEY_POOLS[provider].remove(current_key)
+                    ITERATORS[provider] = cycle(KEY_POOLS[provider]) if KEY_POOLS[provider] else None
+
             logger.warning(f"⚠️ Attempt {attempts} for provider {provider} failed: {e}")
-            # Stop retrying if we've exhausted the pool or provider not handled
-            if provider not in KEY_POOLS or len(tried_keys) >= len(KEY_POOLS[provider]):
+
+            # Stop retrying if池空或已试完
+            if provider not in KEY_POOLS or not KEY_POOLS[provider] or len(tried_keys) >= len(KEY_POOLS[provider]):
                 raise
-            # Otherwise continue to next key
             continue
 
 # ========== 自动预取模型列表并更新 ===========
@@ -1323,10 +1343,16 @@ async def _refresh_available_models():
 # 在 FastAPI 启动时启动后台任务
 @app.on_event("startup")
 async def startup_refresh_models():
-    logger.info("⏳ Refreshing model lists at startup...")
-    await _refresh_available_models()
-    logger.info("✅ Model lists refreshed.")
-# ========== 结束自动预取 ==========
+    """Kick off model list refresh in background so第一条请求不被阻塞"""
+    async def _background():
+        logger.info("⏳ Refreshing model lists in background…")
+        try:
+            await _refresh_available_models()
+            logger.info("✅ Model lists refreshed.")
+        except Exception as e:
+            logger.warning(f"Model list refresh failed: {e}")
+
+    asyncio.create_task(_background())
 
 if __name__ == "__main__":
     import sys

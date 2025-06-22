@@ -24,7 +24,7 @@ VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
 
 router = APIRouter(prefix="/v1/models", tags=["models"])
 
-TIMEOUT = httpx.Timeout(10.0)
+TIMEOUT = httpx.Timeout(10.0, connect=15.0)
 
 # ======== 简单 TTL 缓存装饰器 ========
 

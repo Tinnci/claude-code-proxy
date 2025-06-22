@@ -65,6 +65,35 @@ A proxy server that lets you use Anthropic clients with multiple LLM providers v
    ```
    *(`--reload` is optional, for development)*
 
+### Dependency Groups & Extras 📦
+
+`pyproject.toml` exposes optional dependencies in two complementary ways:
+
+| Type | Table Location | Typical Audience | Install Command |
+|------|----------------|------------------|-----------------|
+| **extras** | `[project.optional-dependencies]` (PEP-621) | End-users who install the wheel from PyPI | `pip install anthropic-proxy[vertex]` |
+| **groups** | `[dependency-groups]` (uv specific) | Developers / CI / staged deployments | `uv sync --group tests` |
+
+Common commands:
+
+```bash
+# Install main dependencies (default + dev)
+uv sync
+
+# Add test tools
+uv sync --group tests
+
+# Add Vertex-AI support
+uv sync --group vertex
+```
+
+Using plain pip you can still consume the *extras* interface:
+
+```bash
+pip install .[vertex]
+pip install .[tests]
+```
+
 ### Using with Claude Code 🎮
 
 1. **Install Claude Code** (if you haven't already):
